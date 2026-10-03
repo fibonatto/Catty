@@ -1,9 +1,9 @@
 //! catty — a tiny terminal companion.
 //!
-//! One file, std only, Unix only.
+//! std only, Unix only.
 //!
-//!   rustc --edition 2021 -O catty.rs -o catty
-//!   eval "$(./catty init zsh)"        # or: eval "$(./catty init bash)"
+//!   cargo build --release            # binary: target/release/catty
+//!   eval "$(target/release/catty init zsh)"   # or: ... init bash
 //!
 //! How it works
 //!   * The shell hook sends ONE event per prompt (command, exit code, duration, cwd)
@@ -36,7 +36,19 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+mod json;
+mod redact;
+mod util;
+mod voice;
+mod wire;
+
+use json::{jstr, json_string_field};
+use redact::redact;
+use util::{basename, human_secs, now_secs, pick_line, sample, strs, Rng};
+use voice::lines::{bank, danger_desc};
+use wire::{escape, wire_fields, Event};
 
 // ───────────────────────────── constants & FFI ─────────────────────────────
 
@@ -122,206 +134,6 @@ impl Config {
     }
 }
 
-// ───────────────────────────── small utilities ─────────────────────────────
-
-struct Rng(u64);
-
-impl Rng {
-    fn new() -> Rng {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(1);
-        Rng(nanos ^ ((std::process::id() as u64) << 32) ^ 0xA5A5_5A5A_1234_5678)
-    }
-
-    // splitmix64: good enough, and unlike `subsec_nanos() % n` it does not
-    // degenerate on clocks with coarse resolution.
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        if n == 0 {
-            0
-        } else {
-            (self.next() % (n as u64)) as usize
-        }
-    }
-
-    fn chance(&mut self, pct: u32) -> bool {
-        self.next() % 100 < pct as u64
-    }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn strs(a: &[&str]) -> Vec<String> {
-    a.iter().map(|s| s.to_string()).collect()
-}
-
-fn basename(p: &str) -> String {
-    p.rsplit('/').next().unwrap_or(p).to_string()
-}
-
-fn human_secs(s: u64) -> String {
-    if s < 60 {
-        format!("{s}s")
-    } else {
-        format!("{}m{:02}s", s / 60, s % 60)
-    }
-}
-
-fn sample(rng: &mut Rng, lines: &[String], n: usize) -> Vec<String> {
-    let mut pool: Vec<String> = lines.to_vec();
-    let mut out = Vec::new();
-    while out.len() < n && !pool.is_empty() {
-        let i = rng.below(pool.len());
-        out.push(pool.swap_remove(i));
-    }
-    out
-}
-
-fn pick_line(rng: &mut Rng, lines: &[String], last: &str) -> String {
-    if lines.is_empty() {
-        return "mrrp.".to_string();
-    }
-    let mut line = &lines[rng.below(lines.len())];
-    if line.as_str() == last && lines.len() > 1 {
-        line = &lines[rng.below(lines.len())];
-    }
-    line.clone()
-}
-
-// Wire format escaping: values never contain a raw newline.
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-}
-
-fn unescape(s: &str) -> String {
-    let mut out = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('\\') => out.push('\\'),
-            Some(x) => {
-                out.push('\\');
-                out.push(x);
-            }
-            None => out.push('\\'),
-        }
-    }
-    out
-}
-
-fn wire_fields(body: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    for line in body.lines().skip(1) {
-        if let Some((k, v)) = line.split_once('=') {
-            m.insert(k.to_string(), unescape(v));
-        }
-    }
-    m
-}
-
-// ───────────────────────────── minimal JSON helpers ─────────────────────────────
-
-fn jstr(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
-fn hex4(it: &mut std::str::Chars) -> Option<u32> {
-    let mut v = 0u32;
-    for _ in 0..4 {
-        v = v * 16 + it.next()?.to_digit(16)?;
-    }
-    Some(v)
-}
-
-// `s` starts right after the opening quote.
-fn decode_json_string(s: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut it = s.chars();
-    while let Some(c) = it.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => match it.next()? {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
-                'b' => out.push('\u{8}'),
-                'f' => out.push('\u{c}'),
-                '/' => out.push('/'),
-                '"' => out.push('"'),
-                '\\' => out.push('\\'),
-                'u' => {
-                    let hi = hex4(&mut it)?;
-                    if (0xD800..0xDC00).contains(&hi) {
-                        if it.next()? != '\\' || it.next()? != 'u' {
-                            return None;
-                        }
-                        let lo = hex4(&mut it)?;
-                        let cp =
-                            0x10000 + ((hi - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
-                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                    } else {
-                        out.push(char::from_u32(hi).unwrap_or('\u{FFFD}'));
-                    }
-                }
-                _ => return None,
-            },
-            c => out.push(c),
-        }
-    }
-    None
-}
-
-fn json_string_field(src: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let mut from = 0;
-    while let Some(pos) = src[from..].find(&needle) {
-        let after = from + pos + needle.len();
-        let rest = src[after..].trim_start();
-        if let Some(r) = rest.strip_prefix(':') {
-            if let Some(r) = r.trim_start().strip_prefix('"') {
-                return decode_json_string(r);
-            }
-        }
-        from = after;
-    }
-    None
-}
 
 // ───────────────────────────── LLM (Ollama over plain HTTP) ─────────────────────────────
 
@@ -484,40 +296,6 @@ fn sanitize(raw: &str, max_chars: usize, single_line: bool) -> Option<String> {
         };
     }
     Some(s)
-}
-
-/// Mask the obvious secrets before a command goes anywhere near a prompt.
-fn is_secretish(k: &str) -> bool {
-    let k = k.to_ascii_lowercase();
-    ["token", "secret", "pass", "key", "auth", "cred"]
-        .iter()
-        .any(|w| k.contains(w))
-}
-
-fn redact(cmd: &str) -> String {
-    let mut hide_next = false;
-    let mut out: Vec<String> = Vec::new();
-    for w in cmd.split_whitespace().take(40) {
-        if hide_next {
-            out.push("***".to_string());
-            hide_next = false;
-            continue;
-        }
-        let lw = w.to_ascii_lowercase();
-        if matches!(
-            lw.as_str(),
-            "--password" | "--passwd" | "--token" | "--secret" | "--api-key" | "-password"
-        ) {
-            hide_next = true;
-            out.push(w.to_string());
-            continue;
-        }
-        match w.split_once('=') {
-            Some((k, _)) if is_secretish(k) => out.push(format!("{k}=***")),
-            _ => out.push(w.to_string()),
-        }
-    }
-    out.join(" ").chars().take(200).collect()
 }
 
 // ───────────────────────────── command analysis ─────────────────────────────
@@ -805,17 +583,6 @@ fn eyes(m: &Moment) -> &'static str {
     }
 }
 
-fn danger_desc(k: &str) -> &'static str {
-    match k {
-        "rm" => "recursive forced delete",
-        "force-push" => "git push --force",
-        "reset-hard" => "git reset --hard",
-        "dd" => "dd writing onto a device",
-        "mkfs" => "formatting a disk",
-        _ => "something risky",
-    }
-}
-
 fn note(m: &Moment) -> String {
     match m {
         Moment::Fail {
@@ -840,154 +607,6 @@ fn note(m: &Moment) -> String {
         Moment::Danger(k) => format!("the user ran something risky ({})", danger_desc(k)),
         Moment::Tool(k) => format!("the command finished fine; it was a '{k}' kind of command"),
         Moment::Plain => "a command finished fine, nothing special".to_string(),
-    }
-}
-
-fn tool_lines(key: &str) -> Vec<String> {
-    match key {
-        "git-commit" => strs(&[
-            "committed. i'm proud. a little.",
-            "another snapshot of your questionable decisions.",
-            "history, written. mrrp.",
-        ]),
-        "git-push" => strs(&["it's out there now. no take-backs.", "off it goes. mew."]),
-        "git-pull" => strs(&[
-            "fresh things from far away.",
-            "what did the others break today?",
-        ]),
-        "git-stash" => strs(&["hiding things? i respect it.", "into the drawer it goes."]),
-        "git-branch" => strs(&[
-            "new branch. new hopes.",
-            "*follows you to the other branch*",
-        ]),
-        "git-merge" => strs(&[
-            "bringing the strays together.",
-            "merge conflicts are just cats fighting.",
-        ]),
-        "git" => strs(&["git again. fascinating.", "history lessons, hm."]),
-        "editor" => strs(&[
-            "back from the editor cave.",
-            "did you write anything, or just stare?",
-        ]),
-        "ssh" => strs(&[
-            "welcome back. did you bring fish?",
-            "other machines smell different, don't they.",
-        ]),
-        "cat" => strs(&["that's my name, you know.", "*offended purr*"]),
-        "sleep" => strs(&["nap time. finally, someone gets it.", "i'm better at that."]),
-        "clear" => strs(&["a clean slate. i hid the evidence.", "tidy. suspicious."]),
-        "man" => strs(&[
-            "reading the manual? who are you.",
-            "*is impressed, against own will*",
-        ]),
-        "top" => strs(&["watching the numbers dance.", "so many little processes."]),
-        "build" => strs(&[
-            "the machine hums. i approve.",
-            "building things again. good.",
-        ]),
-        "container" => strs(&["boxes inside boxes. i approve.", "i do love a good box."]),
-        "ping" => strs(&["is anybody out there? mew.", "knock knock."]),
-        "net" => strs(&[
-            "fetching things from far away.",
-            "*ears twitch at the packets*",
-        ]),
-        "ollama" => strs(&["ah. a rival.", "is that my cousin? i can't tell."]),
-        "search" => strs(&["hunting? i approve.", "*tail swish* what are we stalking?"]),
-        "rm" => strs(&["gone. just like that.", "a clean kill. mrrp."]),
-        "sudo" => strs(&["ooh, powers.", "with great power comes... a nap."]),
-        _ => strs(&["mrrp."]),
-    }
-}
-
-fn bank(m: &Moment) -> Vec<String> {
-    match m {
-        Moment::Fail {
-            code,
-            streak,
-            repeat,
-        } => {
-            if *streak >= 3 {
-                vec![
-                    format!("{streak} in a row. i'm counting."),
-                    format!("...{streak}. want me to look away?"),
-                    "we're in a loop. i can feel it.".to_string(),
-                ]
-            } else if *repeat {
-                strs(&[
-                    "same command. same result.",
-                    "again? bold strategy.",
-                    "i'd try something different. just saying.",
-                    "the definition of insanity, you know.",
-                ])
-            } else if *code == 139 {
-                strs(&["segfault. classic.", "memory is a dangerous place."])
-            } else if *code == 137 || *code == 143 {
-                strs(&[
-                    "something got killed. rudely.",
-                    "it didn't even say goodbye.",
-                ])
-            } else {
-                strs(&[
-                    "well. that didn't work.",
-                    "mew. that sounded painful.",
-                    "*watches the error scroll by*",
-                    "it said no.",
-                    "brave. wrong, but brave.",
-                    "i saw nothing. nothing at all.",
-                ])
-            }
-        }
-        Moment::NotFound => strs(&[
-            "that's not a command. that's a wish.",
-            "typo? or optimism.",
-            "no such thing. i checked.",
-            "the shell doesn't know that word either.",
-        ]),
-        Moment::Interrupted => strs(&[
-            "you gave up. valid.",
-            "ctrl-c. the quitter's choice. i respect it.",
-            "stopped it midair. wise or impatient?",
-        ]),
-        Moment::Slow { secs } => {
-            let h = human_secs(*secs);
-            vec![
-                format!("{h} to finish. i napped through it."),
-                format!("that took {h}. i dreamed of fish."),
-                "finally. my whiskers aged.".to_string(),
-            ]
-        }
-        Moment::Danger(k) => match *k {
-            "rm" => strs(&[
-                "*stares at the rm -rf*",
-                "my fur is standing up.",
-                "i hope you meant that.",
-            ]),
-            "force-push" => strs(&[
-                "force push. bold. i'm hiding.",
-                "rewriting history, are we.",
-            ]),
-            "reset-hard" => strs(&["hard reset. goodbye, work.", "...it's gone, isn't it."]),
-            "dd" => strs(&[
-                "dd. the disk destroyer. careful.",
-                "i'm not saying don't. i'm saying mew.",
-            ]),
-            "mkfs" => strs(&[
-                "a fresh disk. such confidence.",
-                "everything on it was a dream now.",
-            ]),
-            _ => strs(&["that looked risky. mew."]),
-        },
-        Moment::Tool(k) => tool_lines(k),
-        Moment::Plain => strs(&[
-            "mrrp.",
-            "hm.",
-            "*blinks slowly*",
-            "i'm watching.",
-            "carry on.",
-            "interesting.",
-            "*tail flick*",
-            "prrr.",
-        ]),
     }
 }
 
@@ -1052,38 +671,6 @@ fn chat_fallback(msg: &str, rng: &mut Rng) -> String {
 }
 
 // ───────────────────────────── daemon state ─────────────────────────────
-
-struct Event {
-    session: String,
-    cwd: String,
-    cmd: String,
-    exit: i32,
-    secs: u64,
-}
-
-impl Event {
-    fn to_wire(&self) -> String {
-        format!(
-            "event\nsession={}\ncwd={}\ncmd={}\nexit={}\nsecs={}\n",
-            escape(&self.session),
-            escape(&self.cwd),
-            escape(&self.cmd),
-            self.exit,
-            self.secs
-        )
-    }
-
-    fn from_wire(body: &str) -> Option<Event> {
-        let f = wire_fields(body);
-        Some(Event {
-            session: f.get("session")?.clone(),
-            cwd: f.get("cwd").cloned().unwrap_or_default(),
-            cmd: f.get("cmd")?.clone(),
-            exit: f.get("exit").and_then(|v| v.parse().ok()).unwrap_or(0),
-            secs: f.get("secs").and_then(|v| v.parse().ok()).unwrap_or(0),
-        })
-    }
-}
 
 struct Entry {
     cmd: String,
@@ -1821,22 +1408,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_roundtrip() {
-        let s = "a\\b\nc\rd";
-        assert_eq!(unescape(&escape(s)), s);
-        assert!(!escape(s).contains('\n'));
-    }
-
-    #[test]
-    fn json_decode() {
-        let j = r#"{"model":"x","response":"hi \"there\"\nok \u00e9 \ud83d\ude00","done":true}"#;
-        assert_eq!(
-            json_string_field(j, "response").as_deref(),
-            Some("hi \"there\"\nok é 😀")
-        );
-    }
-
-    #[test]
     fn sanitize_strips_think_quotes_and_controls() {
         let raw = "<think>hmm</think>\n\"Mrrp. nice.\x1b[2K\"\nsecond line";
         assert_eq!(sanitize(raw, 120, true).as_deref(), Some("Mrrp. nice."));
@@ -1852,14 +1423,6 @@ mod tests {
         assert_eq!(d("git reset --hard HEAD~1"), Some("reset-hard"));
         assert_eq!(d("rm file.txt"), None);
         assert_eq!(d("git push origin main"), None);
-    }
-
-    #[test]
-    fn redaction() {
-        assert_eq!(
-            redact("curl --token abc API_KEY=zzz ls"),
-            "curl --token *** API_KEY=*** ls"
-        );
     }
 
     #[test]
