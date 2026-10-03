@@ -1,6 +1,8 @@
 //! What just happened at the prompt (`Moment`), and how likely the cat is to react.
 //! Pure functions, no I/O and no randomness.
 
+use crate::command::{Danger, Tool};
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum Moment {
     Fail {
@@ -13,8 +15,8 @@ pub(crate) enum Moment {
     Slow {
         secs: u64,
     },
-    Danger(&'static str),
-    Tool(&'static str),
+    Danger(Danger),
+    Tool(Tool),
     Plain,
 }
 
@@ -23,8 +25,8 @@ pub(crate) fn classify(
     secs: u64,
     streak: u32,
     repeat: bool,
-    tool: Option<&'static str>,
-    danger: Option<&'static str>,
+    tool: Option<Tool>,
+    danger: Option<Danger>,
 ) -> Moment {
     if let Some(d) = danger {
         return Moment::Danger(d);
@@ -33,10 +35,7 @@ pub(crate) fn classify(
         130 => Moment::Interrupted,
         127 => Moment::NotFound,
         0 => {
-            let interactive = matches!(
-                tool,
-                Some("editor") | Some("ssh") | Some("top") | Some("man")
-            );
+            let interactive = tool.is_some_and(Tool::is_interactive);
             if secs >= 20 && !interactive {
                 Moment::Slow { secs }
             } else if let Some(t) = tool {
@@ -97,16 +96,16 @@ mod tests {
         assert_eq!(classify(127, 0, 1, false, None, None), Moment::NotFound);
         assert_eq!(classify(130, 0, 0, false, None, None), Moment::Interrupted);
         assert_eq!(
-            classify(0, 45, 0, false, Some("build"), None),
+            classify(0, 45, 0, false, Some(Tool::Build), None),
             Moment::Slow { secs: 45 }
         );
         assert_eq!(
-            classify(0, 900, 0, false, Some("editor"), None),
-            Moment::Tool("editor")
+            classify(0, 900, 0, false, Some(Tool::Editor), None),
+            Moment::Tool(Tool::Editor)
         );
         assert_eq!(
-            classify(0, 1, 0, false, None, Some("rm")),
-            Moment::Danger("rm")
+            classify(0, 1, 0, false, None, Some(Danger::Rm)),
+            Moment::Danger(Danger::Rm)
         );
     }
 }

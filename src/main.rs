@@ -47,7 +47,7 @@ mod voice;
 mod wire;
 
 use command::{danger_kind, parse_segments, tool_key};
-use json::{jstr, json_string_field};
+use json::{json_string_field, jstr};
 use moment::{base_chance, classify, is_strong, Moment};
 use redact::redact;
 use util::{basename, human_secs, now_secs, pick_line, sample, strs, Rng};
@@ -137,7 +137,6 @@ impl Config {
         }
     }
 }
-
 
 // ───────────────────────────── LLM (Ollama over plain HTTP) ─────────────────────────────
 
@@ -385,8 +384,11 @@ fn note(m: &Moment) -> String {
         Moment::Slow { secs } => {
             format!("the command finally finished after {}", human_secs(*secs))
         }
-        Moment::Danger(k) => format!("the user ran something risky ({})", danger_desc(k)),
-        Moment::Tool(k) => format!("the command finished fine; it was a '{k}' kind of command"),
+        Moment::Danger(k) => format!("the user ran something risky ({})", danger_desc(*k)),
+        Moment::Tool(k) => format!(
+            "the command finished fine; it was a '{}' kind of command",
+            k.name()
+        ),
         Moment::Plain => "a command finished fine, nothing special".to_string(),
     }
 }
@@ -429,8 +431,6 @@ fn chat_fallback(msg: &str, rng: &mut Rng) -> String {
             "ask me after a nap.",
             "hm. mew?",
         ])
-    } else if any(&["money", "salary", "paycheck"]) {
-        strs(&["where?", "it's gone.", "i was wondering the same thing."])
     } else if any(&["monday"]) {
         strs(&["no.", "absolutely not.", "*goes back to sleep*"])
     } else if any(&["friday"]) {

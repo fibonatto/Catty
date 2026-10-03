@@ -3,6 +3,78 @@
 
 use crate::util::basename;
 
+/// A command worth a raised eyebrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Danger {
+    Rm,
+    ForcePush,
+    ResetHard,
+    Dd,
+    Mkfs,
+}
+
+/// Coarse kind of command the cat has opinions about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tool {
+    GitCommit,
+    GitPush,
+    GitPull,
+    GitStash,
+    GitBranch,
+    GitMerge,
+    Git,
+    Editor,
+    Ssh,
+    Cat,
+    Sleep,
+    Clear,
+    Man,
+    Top,
+    Build,
+    Container,
+    Ping,
+    Net,
+    Ollama,
+    Search,
+    Rm,
+    Sudo,
+}
+
+impl Tool {
+    /// Stable name; it is sent to the LLM in the event prompt.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Tool::GitCommit => "git-commit",
+            Tool::GitPush => "git-push",
+            Tool::GitPull => "git-pull",
+            Tool::GitStash => "git-stash",
+            Tool::GitBranch => "git-branch",
+            Tool::GitMerge => "git-merge",
+            Tool::Git => "git",
+            Tool::Editor => "editor",
+            Tool::Ssh => "ssh",
+            Tool::Cat => "cat",
+            Tool::Sleep => "sleep",
+            Tool::Clear => "clear",
+            Tool::Man => "man",
+            Tool::Top => "top",
+            Tool::Build => "build",
+            Tool::Container => "container",
+            Tool::Ping => "ping",
+            Tool::Net => "net",
+            Tool::Ollama => "ollama",
+            Tool::Search => "search",
+            Tool::Rm => "rm",
+            Tool::Sudo => "sudo",
+        }
+    }
+
+    /// Commands that run for a long time because the user is busy in them, not waiting on them.
+    pub(crate) fn is_interactive(self) -> bool {
+        matches!(self, Tool::Editor | Tool::Ssh | Tool::Top | Tool::Man)
+    }
+}
+
 pub(crate) struct Seg {
     pub(crate) prog: String,
     args: Vec<String>,
@@ -61,7 +133,7 @@ fn first_sub(s: &Seg) -> &str {
         .unwrap_or("")
 }
 
-pub(crate) fn danger_kind(s: &Seg) -> Option<&'static str> {
+pub(crate) fn danger_kind(s: &Seg) -> Option<Danger> {
     let flags: String = s
         .args
         .iter()
@@ -75,60 +147,60 @@ pub(crate) fn danger_kind(s: &Seg) -> Option<&'static str> {
             let rec = flags.contains('r') || flags.contains('R') || has("--recursive");
             let force = flags.contains('f') || has("--force");
             if (rec && force) || has("--no-preserve-root") {
-                Some("rm")
+                Some(Danger::Rm)
             } else {
                 None
             }
         }
         "git" => match first_sub(s) {
             "push" if has("--force") || has("-f") || has("--force-with-lease") => {
-                Some("force-push")
+                Some(Danger::ForcePush)
             }
-            "reset" if has("--hard") => Some("reset-hard"),
+            "reset" if has("--hard") => Some(Danger::ResetHard),
             _ => None,
         },
         "dd" => {
             if s.args.iter().any(|a| a.starts_with("of=/dev/")) {
-                Some("dd")
+                Some(Danger::Dd)
             } else {
                 None
             }
         }
-        p if p.starts_with("mkfs") => Some("mkfs"),
+        p if p.starts_with("mkfs") => Some(Danger::Mkfs),
         _ => None,
     }
 }
 
-pub(crate) fn tool_key(segs: &[Seg]) -> Option<&'static str> {
+pub(crate) fn tool_key(segs: &[Seg]) -> Option<Tool> {
     let s = segs.first()?;
     let k = match s.prog.as_str() {
         "git" => match first_sub(s) {
-            "commit" => "git-commit",
-            "push" => "git-push",
-            "pull" | "fetch" => "git-pull",
-            "stash" => "git-stash",
-            "checkout" | "switch" => "git-branch",
-            "merge" | "rebase" => "git-merge",
-            _ => "git",
+            "commit" => Tool::GitCommit,
+            "push" => Tool::GitPush,
+            "pull" | "fetch" => Tool::GitPull,
+            "stash" => Tool::GitStash,
+            "checkout" | "switch" => Tool::GitBranch,
+            "merge" | "rebase" => Tool::GitMerge,
+            _ => Tool::Git,
         },
-        "vim" | "nvim" | "vi" | "nano" | "emacs" | "hx" => "editor",
-        "ssh" => "ssh",
-        "cat" => "cat",
-        "sleep" => "sleep",
-        "clear" => "clear",
-        "man" | "tldr" => "man",
-        "top" | "htop" | "btop" => "top",
+        "vim" | "nvim" | "vi" | "nano" | "emacs" | "hx" => Tool::Editor,
+        "ssh" => Tool::Ssh,
+        "cat" => Tool::Cat,
+        "sleep" => Tool::Sleep,
+        "clear" => Tool::Clear,
+        "man" | "tldr" => Tool::Man,
+        "top" | "htop" | "btop" => Tool::Top,
         "make" | "cmake" | "cargo" | "gcc" | "clang" | "rustc" | "go" | "zig" | "npm" | "pnpm"
-        | "yarn" | "gradle" | "mvn" => "build",
-        "docker" | "podman" | "kubectl" => "container",
-        "ping" => "ping",
-        "curl" | "wget" => "net",
-        "ollama" => "ollama",
-        "grep" | "rg" | "find" | "fd" => "search",
-        "rm" => "rm",
+        | "yarn" | "gradle" | "mvn" => Tool::Build,
+        "docker" | "podman" | "kubectl" => Tool::Container,
+        "ping" => Tool::Ping,
+        "curl" | "wget" => Tool::Net,
+        "ollama" => Tool::Ollama,
+        "grep" | "rg" | "find" | "fd" => Tool::Search,
+        "rm" => Tool::Rm,
         _ => {
             if s.sudo {
-                "sudo"
+                Tool::Sudo
             } else {
                 return None;
             }
@@ -144,19 +216,19 @@ mod tests {
     #[test]
     fn danger_detection() {
         let d = |c: &str| parse_segments(c).iter().find_map(danger_kind);
-        assert_eq!(d("sudo rm -rf /tmp/x"), Some("rm"));
-        assert_eq!(d("cd x && rm -fr build"), Some("rm"));
-        assert_eq!(d("git push --force origin main"), Some("force-push"));
-        assert_eq!(d("git reset --hard HEAD~1"), Some("reset-hard"));
+        assert_eq!(d("sudo rm -rf /tmp/x"), Some(Danger::Rm));
+        assert_eq!(d("cd x && rm -fr build"), Some(Danger::Rm));
+        assert_eq!(d("git push --force origin main"), Some(Danger::ForcePush));
+        assert_eq!(d("git reset --hard HEAD~1"), Some(Danger::ResetHard));
         assert_eq!(d("rm file.txt"), None);
         assert_eq!(d("git push origin main"), None);
     }
 
     fn key(c: &str) -> Option<&'static str> {
-        tool_key(&parse_segments(c))
+        tool_key(&parse_segments(c)).map(Tool::name)
     }
 
-    // Characterization: pins what `tool_key` does today, so the move to an enum is checkable.
+    // Characterization: pins the command -> tool mapping AND the tool names (they go to the LLM).
     #[test]
     fn tool_key_table() {
         let cases: &[(&str, Option<&str>)] = &[
