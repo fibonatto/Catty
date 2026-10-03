@@ -3,6 +3,8 @@
 
 Catty is a minimal terminal companion prototype. This initial version is implemented as a single-file Rust application using only the standard library (`std`), targeting Unix systems. It serves as a proof of concept to validate the core interaction model and is scheduled for future refactoring, optimization, and modularization.
 
+![catty](print.png)
+
 ## Architecture
 
 The system operates strictly locally and consists of two main execution paths:
