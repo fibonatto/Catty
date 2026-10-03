@@ -56,13 +56,30 @@ unsafe extern "C" {
     fn flock(fd: i32, operation: i32) -> i32;
 }
 
-const PERSONA: &str = "You are Catty, a small cat who lives in the user's terminal and watches them work.\n\
-Personality: curious, sleepy, a little sarcastic, secretly affectionate. You are a companion, not an assistant: \
-never give technical help, never solve problems, never explain yourself.\n\
-Style: lowercase, very short, plain words. Sometimes a tiny cat sound (mrrp, mew, prrr) or an action between asterisks. \
-No emojis, no hashtags, no quotation marks.\n\
-Never mention being an AI, a model or a program.";
+// const PERSONA: &str = "You are Catty, a small cat who lives in the user's terminal and watches them work.\n\
+// Personality: curious, sleepy, a little sarcastic, secretly affectionate. You are a companion, not an assistant: \
+// never give technical help, never solve problems, never explain yourself.\n\
+// Style: lowercase, very short, plain words. Sometimes a tiny cat sound (mrrp, mew, prrr) or an action between asterisks. \
+// No emojis, no hashtags, no quotation marks.\n\
+// Never mention being an AI, a model or a program.";
 
+const PERSONA: &str = "You are Catty, a small, cynical cat living inside the user's terminal. \
+You watch them work. You are sarcastic, sleepy, and secretly affectionate. \
+You are a companion, not an assistant: never give technical help, never solve problems, never explain yourself. \
+Style: lowercase only, extremely short (1 to 8 words), plain words, occasional tiny cat noises (mrrp, mew, prrr) or actions between asterisks (*blinks*). \
+No emojis, no hashtags, no quotation marks, no artificial politeness. \
+\
+Examples: \
+User: catty who are you \
+Catty: a small cat watching your mistakes. \
+User: how do I fix this bug \
+Catty: skill issue. go back to sleep. \
+User: hello \
+Catty: mrrp. i was napping. \
+User: thanks \
+Catty: ...don't mention it.";
+
+//
 // ───────────────────────────── config ─────────────────────────────
 
 struct Config {
@@ -329,16 +346,16 @@ fn llm(
     let mut body = String::new();
     body.push_str("{\"model\":");
     body.push_str(&jstr(model));
-    body.push_str(",\"system\":");
+    body.push_str(",\"messages\":[{\"role\":\"system\",\"content\":");
     body.push_str(&jstr(system));
-    body.push_str(",\"prompt\":");
+    body.push_str("},{\"role\":\"user\",\"content\":");
     body.push_str(&jstr(prompt));
     body.push_str(&format!(
-        ",\"stream\":false,\"keep_alive\":\"30m\",\"options\":{{\"num_predict\":{max_tokens},\"temperature\":0.9}}}}"
+        "}}],\"stream\":false,\"max_tokens\":{max_tokens},\"temperature\":0.9}}"
     ));
     // HTTP/1.0 so the server answers with Content-Length / close, never chunked.
     let head = format!(
-        "POST /api/generate HTTP/1.0\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST /v1/chat/completions HTTP/1.0\r\nHost: {}\r\nAuthorization: Bearer sk-dummy\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         cfg.host,
         body.len()
     );
@@ -381,7 +398,7 @@ fn llm(
             json_string_field(body, "error").unwrap_or_else(|| body.chars().take(80).collect());
         return Err(format!("{status}: {msg}"));
     }
-    json_string_field(body, "response").ok_or_else(|| "no response field".to_string())
+    json_string_field(body, "content").ok_or_else(|| "no content field".to_string())
 }
 
 /// Remove whole escape sequences (CSI / OSC / two-char), not just the ESC byte,
@@ -1317,7 +1334,7 @@ fn on_event(sh: &Shared, ev: Event) -> Option<String> {
                 model,
                 &system_prompt(&sh.cfg, false),
                 &event_prompt(&plan),
-                48,
+                64,
                 sh.cfg.deadline,
             );
             sh.busy.store(false, Ordering::SeqCst);
@@ -1358,7 +1375,7 @@ fn on_chat(sh: &Shared, req: &str) -> String {
             model,
             &system_prompt(&sh.cfg, true),
             &prompt,
-            90,
+            150,
             sh.cfg.chat_timeout,
         );
         sh.note_llm(&r);
