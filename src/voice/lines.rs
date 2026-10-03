@@ -1,7 +1,7 @@
 //! The cat's built-in voice: pure data keyed by moment. No I/O, no state.
 
 use crate::util::{human_secs, strs};
-use crate::Moment;
+use crate::moment::Moment;
 
 pub(crate) fn danger_desc(k: &str) -> &'static str {
     match k {
@@ -159,5 +159,23 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
             "*tail flick*",
             "prrr.",
         ]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A typo'd key silently falls into the one-line "mrrp." fallback; this catches it.
+    #[test]
+    fn every_tool_key_has_its_own_lines() {
+        let keys = [
+            "git-commit", "git-push", "git-pull", "git-stash", "git-branch", "git-merge", "git",
+            "editor", "ssh", "cat", "sleep", "clear", "man", "top", "build", "container", "ping",
+            "net", "ollama", "search", "rm", "sudo",
+        ];
+        for k in keys {
+            assert!(tool_lines(k).len() >= 2, "no lines for tool key {k:?}");
+        }
     }
 }

@@ -38,13 +38,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod command;
 mod json;
+mod moment;
 mod redact;
 mod util;
 mod voice;
 mod wire;
 
+use command::{danger_kind, parse_segments, tool_key};
 use json::{jstr, json_string_field};
+use moment::{base_chance, classify, is_strong, Moment};
 use redact::redact;
 use util::{basename, human_secs, now_secs, pick_line, sample, strs, Rng};
 use voice::lines::{bank, danger_desc};
@@ -298,230 +302,7 @@ fn sanitize(raw: &str, max_chars: usize, single_line: bool) -> Option<String> {
     Some(s)
 }
 
-// ───────────────────────────── command analysis ─────────────────────────────
-
-struct Seg {
-    prog: String,
-    args: Vec<String>,
-    sudo: bool,
-}
-
-fn is_assignment(w: &str) -> bool {
-    match w.split_once('=') {
-        Some((k, _)) => {
-            !k.is_empty()
-                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                && !k.chars().next().map_or(false, |c| c.is_ascii_digit())
-        }
-        None => false,
-    }
-}
-
-fn parse_seg(part: &str) -> Option<Seg> {
-    let mut sudo = false;
-    let mut words = part.split_whitespace();
-    let mut prog: Option<String> = None;
-    while let Some(w) = words.next() {
-        if is_assignment(w) {
-            continue;
-        }
-        match w {
-            "sudo" | "doas" => {
-                sudo = true;
-                continue;
-            }
-            "time" | "nohup" | "command" | "env" | "exec" | "nice" | "builtin" => continue,
-            _ => {}
-        }
-        if sudo && w.starts_with('-') {
-            continue;
-        }
-        prog = Some(basename(w));
-        break;
-    }
-    let prog = prog?;
-    let args: Vec<String> = words.map(|s| s.to_string()).collect();
-    Some(Seg { prog, args, sudo })
-}
-
-fn parse_segments(cmd: &str) -> Vec<Seg> {
-    cmd.split(|c: char| c == ';' || c == '|' || c == '&')
-        .filter_map(parse_seg)
-        .collect()
-}
-
-fn first_sub(s: &Seg) -> &str {
-    s.args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(String::as_str)
-        .unwrap_or("")
-}
-
-fn danger_kind(s: &Seg) -> Option<&'static str> {
-    let flags: String = s
-        .args
-        .iter()
-        .filter(|a| a.starts_with('-') && !a.starts_with("--"))
-        .map(|a| &a[1..])
-        .collect::<Vec<_>>()
-        .join("");
-    let has = |name: &str| s.args.iter().any(|a| a == name);
-    match s.prog.as_str() {
-        "rm" => {
-            let rec = flags.contains('r') || flags.contains('R') || has("--recursive");
-            let force = flags.contains('f') || has("--force");
-            if (rec && force) || has("--no-preserve-root") {
-                Some("rm")
-            } else {
-                None
-            }
-        }
-        "git" => match first_sub(s) {
-            "push" if has("--force") || has("-f") || has("--force-with-lease") => {
-                Some("force-push")
-            }
-            "reset" if has("--hard") => Some("reset-hard"),
-            _ => None,
-        },
-        "dd" => {
-            if s.args.iter().any(|a| a.starts_with("of=/dev/")) {
-                Some("dd")
-            } else {
-                None
-            }
-        }
-        p if p.starts_with("mkfs") => Some("mkfs"),
-        _ => None,
-    }
-}
-
-fn tool_key(segs: &[Seg]) -> Option<&'static str> {
-    let s = segs.first()?;
-    let k = match s.prog.as_str() {
-        "git" => match first_sub(s) {
-            "commit" => "git-commit",
-            "push" => "git-push",
-            "pull" | "fetch" => "git-pull",
-            "stash" => "git-stash",
-            "checkout" | "switch" => "git-branch",
-            "merge" | "rebase" => "git-merge",
-            _ => "git",
-        },
-        "vim" | "nvim" | "vi" | "nano" | "emacs" | "hx" => "editor",
-        "ssh" => "ssh",
-        "cat" => "cat",
-        "sleep" => "sleep",
-        "clear" => "clear",
-        "man" | "tldr" => "man",
-        "top" | "htop" | "btop" => "top",
-        "make" | "cmake" | "cargo" | "gcc" | "clang" | "rustc" | "go" | "zig" | "npm" | "pnpm"
-        | "yarn" | "gradle" | "mvn" => "build",
-        "docker" | "podman" | "kubectl" => "container",
-        "ping" => "ping",
-        "curl" | "wget" => "net",
-        "ollama" => "ollama",
-        "grep" | "rg" | "find" | "fd" => "search",
-        "rm" => "rm",
-        _ => {
-            if s.sudo {
-                "sudo"
-            } else {
-                return None;
-            }
-        }
-    };
-    Some(k)
-}
-
 // ───────────────────────────── the cat's voice ─────────────────────────────
-
-#[derive(Debug, PartialEq)]
-enum Moment {
-    Fail {
-        code: i32,
-        streak: u32,
-        repeat: bool,
-    },
-    NotFound,
-    Interrupted,
-    Slow {
-        secs: u64,
-    },
-    Danger(&'static str),
-    Tool(&'static str),
-    Plain,
-}
-
-fn classify(
-    exit: i32,
-    secs: u64,
-    streak: u32,
-    repeat: bool,
-    tool: Option<&'static str>,
-    danger: Option<&'static str>,
-) -> Moment {
-    if let Some(d) = danger {
-        return Moment::Danger(d);
-    }
-    match exit {
-        130 => Moment::Interrupted,
-        127 => Moment::NotFound,
-        0 => {
-            let interactive = matches!(
-                tool,
-                Some("editor") | Some("ssh") | Some("top") | Some("man")
-            );
-            if secs >= 20 && !interactive {
-                Moment::Slow { secs }
-            } else if let Some(t) = tool {
-                Moment::Tool(t)
-            } else {
-                Moment::Plain
-            }
-        }
-        code => Moment::Fail {
-            code,
-            streak,
-            repeat,
-        },
-    }
-}
-
-fn base_chance(m: &Moment) -> u32 {
-    match m {
-        Moment::Fail { streak, repeat, .. } => {
-            if *streak >= 3 {
-                85
-            } else if *repeat {
-                70
-            } else {
-                45
-            }
-        }
-        Moment::NotFound => 60,
-        Moment::Interrupted => 20,
-        Moment::Slow { secs } => {
-            if *secs >= 300 {
-                100
-            } else if *secs >= 60 {
-                85
-            } else {
-                60
-            }
-        }
-        Moment::Danger(_) => 85,
-        Moment::Tool(_) => 25,
-        Moment::Plain => 4,
-    }
-}
-
-// Strong moments may speak even inside the cooldown window.
-fn is_strong(m: &Moment) -> bool {
-    matches!(m, Moment::Danger(_))
-        || matches!(m, Moment::Fail { streak, .. } if *streak >= 3)
-        || matches!(m, Moment::Slow { secs } if *secs >= 120)
-}
 
 #[derive(Clone, Copy)]
 enum Face {
@@ -1412,34 +1193,5 @@ mod tests {
         let raw = "<think>hmm</think>\n\"Mrrp. nice.\x1b[2K\"\nsecond line";
         assert_eq!(sanitize(raw, 120, true).as_deref(), Some("Mrrp. nice."));
         assert_eq!(sanitize("<think>unterminated", 120, true), None);
-    }
-
-    #[test]
-    fn danger_detection() {
-        let d = |c: &str| parse_segments(c).iter().find_map(danger_kind);
-        assert_eq!(d("sudo rm -rf /tmp/x"), Some("rm"));
-        assert_eq!(d("cd x && rm -fr build"), Some("rm"));
-        assert_eq!(d("git push --force origin main"), Some("force-push"));
-        assert_eq!(d("git reset --hard HEAD~1"), Some("reset-hard"));
-        assert_eq!(d("rm file.txt"), None);
-        assert_eq!(d("git push origin main"), None);
-    }
-
-    #[test]
-    fn classification() {
-        assert_eq!(classify(127, 0, 1, false, None, None), Moment::NotFound);
-        assert_eq!(classify(130, 0, 0, false, None, None), Moment::Interrupted);
-        assert_eq!(
-            classify(0, 45, 0, false, Some("build"), None),
-            Moment::Slow { secs: 45 }
-        );
-        assert_eq!(
-            classify(0, 900, 0, false, Some("editor"), None),
-            Moment::Tool("editor")
-        );
-        assert_eq!(
-            classify(0, 1, 0, false, None, Some("rm")),
-            Moment::Danger("rm")
-        );
     }
 }
