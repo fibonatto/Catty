@@ -1,6 +1,7 @@
 //! The cat's built-in voice: pure data keyed by moment. No I/O, no state.
 
 use crate::command::{Danger, Tool};
+use crate::memory::Fact;
 use crate::moment::Moment;
 use crate::util::{human_secs, strs};
 
@@ -81,6 +82,8 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
                     format!("{streak} in a row. i'm counting."),
                     format!("...{streak}. want me to look away?"),
                     "we're in a loop. i can feel it.".to_string(),
+                    "this isn't debugging. it's vibes.".to_string(),
+                    format!("{streak} failures. i'm taking notes."),
                 ]
             } else if *repeat {
                 strs(&[
@@ -88,6 +91,8 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
                     "again? bold strategy.",
                     "i'd try something different. just saying.",
                     "the definition of insanity, you know.",
+                    "that's the same command. literally.",
+                    "i'm not mad. i'm just watching you loop.",
                 ])
             } else if *code == 139 {
                 strs(&["segfault. classic.", "memory is a dangerous place."])
@@ -104,6 +109,9 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
                     "it said no.",
                     "brave. wrong, but brave.",
                     "i saw nothing. nothing at all.",
+                    "somewhere a rubber duck is crying.",
+                    "bold of you to assume that would work.",
+                    "that was a choice. a bad one.",
                 ])
             }
         }
@@ -112,11 +120,14 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
             "typo? or optimism.",
             "no such thing. i checked.",
             "the shell doesn't know that word either.",
+            "typing is a skill. you lack it.",
+            "is that even a word?",
         ]),
         Moment::Interrupted => strs(&[
             "you gave up. valid.",
             "ctrl-c. the quitter's choice. i respect it.",
             "stopped it midair. wise or impatient?",
+            "ctrl-c. the coward's exit.",
         ]),
         Moment::Slow { secs } => {
             let h = human_secs(*secs);
@@ -124,6 +135,8 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
                 format!("{h} to finish. i napped through it."),
                 format!("that took {h}. i dreamed of fish."),
                 "finally. my whiskers aged.".to_string(),
+                format!("{h}. productive. truly."),
+                format!("{h} of waiting. i judged you the whole time."),
             ]
         }
         Moment::Danger(k) => match *k {
@@ -131,12 +144,14 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
                 "*stares at the rm -rf*",
                 "my fur is standing up.",
                 "i hope you meant that.",
+                "no backup, huh. classic.",
             ]),
             Danger::ForcePush => strs(&[
                 "force push. bold. i'm hiding.",
                 "rewriting history, are we.",
+                "your teammates will love this.",
             ]),
-            Danger::ResetHard => strs(&["hard reset. goodbye, work.", "...it's gone, isn't it."]),
+            Danger::ResetHard => strs(&["hard reset. goodbye, work.", "...it's gone, isn't it.", "git remembers. you won't."]),
             Danger::Dd => strs(&[
                 "dd. the disk destroyer. careful.",
                 "i'm not saying don't. i'm saying mew.",
@@ -156,6 +171,69 @@ pub(crate) fn bank(m: &Moment) -> Vec<String> {
             "interesting.",
             "*tail flick*",
             "prrr.",
+            "that's it? thrilling.",
+            "riveting work.",
+            "still here. still watching.",
+            "*yawns pointedly*",
+        ]),
+    }
+}
+
+/// What the cat says, without an LLM, about something it remembers.
+pub(crate) fn fact_lines(f: &Fact) -> Vec<String> {
+    match f {
+        Fact::StreakRecord { n } => vec![
+            format!("{n} in a row. a personal best."),
+            format!("new record: {n} failures. i'm almost proud."),
+            format!("{n} straight failures. history was made."),
+        ],
+        Fact::SlowRecord { secs } => {
+            let h = human_secs(*secs);
+            vec![
+                format!("{h}. your slowest ever. congratulations."),
+                format!("new record: {h}. i aged a year."),
+                "slowest thing you've ever run. wow.".to_string(),
+            ]
+        }
+        Fact::DangerAgain { danger, n } => {
+            let d = danger.name();
+            vec![
+                format!("{d} again. you never learn."),
+                format!("{n} dangerous ones today. bold."),
+                "i see we're repeating the dangerous things.".to_string(),
+            ]
+        }
+        Fact::NthFail { tool, n } => {
+            let t = tool.name();
+            vec![
+                format!("{n} failed {t} today. i'm counting."),
+                format!("{t} hates you. {n} times today."),
+                format!("{t} failed again. that's {n}."),
+            ]
+        }
+        Fact::FailsToday { n } => vec![
+            format!("{n} failures today. impressive."),
+            format!("{n} errors and counting. persistence."),
+            "a productive day of being wrong.".to_string(),
+        ],
+        Fact::BackAfterDays { days } => vec![
+            format!("{days} days. i thought you died."),
+            format!("gone {days} days. i didn't miss you."),
+            "oh. you again. i was fine.".to_string(),
+        ],
+        Fact::BackAfterHours { hours } => vec![
+            format!("{hours} hours away. i got hungry."),
+            format!("{hours} hours. i didn't miss you. much."),
+            "back already? i was napping.".to_string(),
+        ],
+        Fact::FirstToday => strs(&[
+            "morning. ready to break things?",
+            "first command of the day. let's see the damage.",
+            "mrrp. another day of mistakes.",
+        ]),
+        Fact::FirstEver => strs(&[
+            "new human. i'll be watching.",
+            "so you're the one i'll be judging.",
         ]),
     }
 }

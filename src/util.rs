@@ -1,5 +1,6 @@
 //! Small, dependency-free helpers: RNG, clock, string formatting, line picking.
 
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) struct Rng(u64);
@@ -78,4 +79,45 @@ pub(crate) fn pick_line(rng: &mut Rng, lines: &[String], last: &str) -> String {
         line = &lines[rng.below(lines.len())];
     }
     line.clone()
+}
+
+/// Parse `date +%z` output such as "-0300" or "+0530" into seconds east of UTC.
+pub(crate) fn parse_utc_offset(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 5 || !(b[0] == b'+' || b[0] == b'-') || !b[1..].iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let h: i64 = s[1..3].parse().ok()?;
+    let m: i64 = s[3..5].parse().ok()?;
+    if h > 14 || m >= 60 {
+        return None;
+    }
+    let secs = h * 3600 + m * 60;
+    Some(if b[0] == b'-' { -secs } else { secs })
+}
+
+/// Local UTC offset in seconds. std has no timezone API, so ask `date`; falls back to UTC.
+pub(crate) fn local_offset_secs() -> i64 {
+    match Command::new("date").arg("+%z").output() {
+        Ok(o) if o.status.success() => {
+            parse_utc_offset(String::from_utf8_lossy(&o.stdout).trim()).unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utc_offset_parsing() {
+        assert_eq!(parse_utc_offset("-0300"), Some(-10_800));
+        assert_eq!(parse_utc_offset("+0530"), Some(19_800));
+        assert_eq!(parse_utc_offset("+0000"), Some(0));
+        assert_eq!(parse_utc_offset("UTC"), None);
+        assert_eq!(parse_utc_offset("+1500"), None);
+        assert_eq!(parse_utc_offset("+0360"), None);
+        assert_eq!(parse_utc_offset(""), None);
+    }
 }

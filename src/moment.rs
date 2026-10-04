@@ -56,27 +56,27 @@ pub(crate) fn base_chance(m: &Moment) -> u32 {
     match m {
         Moment::Fail { streak, repeat, .. } => {
             if *streak >= 3 {
-                85
+                90
             } else if *repeat {
-                70
+                75
             } else {
-                45
+                55
             }
         }
-        Moment::NotFound => 60,
-        Moment::Interrupted => 20,
+        Moment::NotFound => 70,
+        Moment::Interrupted => 30,
         Moment::Slow { secs } => {
             if *secs >= 300 {
                 100
             } else if *secs >= 60 {
-                85
+                90
             } else {
-                60
+                70
             }
         }
-        Moment::Danger(_) => 85,
-        Moment::Tool(_) => 25,
-        Moment::Plain => 4,
+        Moment::Danger(_) => 95,
+        Moment::Tool(_) => 35,
+        Moment::Plain => 8,
     }
 }
 

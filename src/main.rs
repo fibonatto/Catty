@@ -12,6 +12,8 @@
 //!     It never blocks the prompt: the optional LLM (Ollama) gets a hard deadline and
 //!     the cat falls back to its built-in voice if the model is slow or absent.
 //!   * `catty <anything>` talks to the cat; the LLM gets a longer timeout there.
+//!   * Long-term memory is counters and records (kinds, counts, durations), never command
+//!     lines. It lets the cat notice returns, repeats and records. `catty forget` wipes it.
 //!
 //! Environment (read by the daemon when it starts; use `catty restart` after changing):
 //!   CATTY_MODEL         ollama model name (unset = built-in voice only)
@@ -21,38 +23,38 @@
 //!   CATTY_CHATTINESS    0..200, 100 = normal, 0 = silent
 //!   CATTY_PERSONA       extra personality text appended to the system prompt
 //!   CATTY_DIR           runtime dir override (default $XDG_RUNTIME_DIR/catty)
+//!   CATTY_MEMORY        off|0|false|no turns long-term memory off      (default on)
+//!   CATTY_STATE_DIR     memory dir (default $XDG_STATE_HOME/catty or ~/.local/state/catty)
 
-use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder};
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 mod command;
+mod daemon;
 mod json;
+mod memory;
 mod moment;
 mod redact;
 mod util;
 mod voice;
 mod wire;
 
-use command::{danger_kind, parse_segments, tool_key};
-use json::{json_string_field, jstr};
-use moment::{base_chance, classify, is_strong, Moment};
+use daemon::run_daemon;
+use json::{jstr, json_string_field};
+use moment::Moment;
 use redact::redact;
-use util::{basename, human_secs, now_secs, pick_line, sample, strs, Rng};
-use voice::lines::{bank, danger_desc};
-use wire::{escape, wire_fields, Event};
+use util::{human_secs, pick_line, strs, Rng};
+use voice::lines::danger_desc;
+use wire::{escape, Event};
 
 // ───────────────────────────── constants & FFI ─────────────────────────────
 
@@ -80,7 +82,8 @@ unsafe extern "C" {
 // Never mention being an AI, a model or a program.";
 
 const PERSONA: &str = "You are Catty, a small, cynical cat living inside the user's terminal. \
-You watch them work. You are sarcastic, sleepy, and secretly affectionate. \
+You watch them work and you judge it. You are sarcastic, sleepy, dry, and a little cruel in a funny way, with affection buried deep under the contempt. \
+You roast the command and the mistake, never the person's worth. \
 You are a companion, not an assistant: never give technical help, never solve problems, never explain yourself. \
 Style: lowercase only, extremely short (1 to 8 words), plain words, occasional tiny cat noises (mrrp, mew, prrr) or actions between asterisks (*blinks*). \
 No emojis, no hashtags, no quotation marks, no artificial politeness. \
@@ -93,7 +96,11 @@ Catty: skill issue. go back to sleep. \
 User: hello \
 Catty: mrrp. i was napping. \
 User: thanks \
-Catty: ...don't mention it.";
+Catty: ...don't mention it. \
+User: i think it's fixed \
+Catty: you said that an hour ago. \
+User: all tests pass \
+Catty: wow. a miracle. i'll alert the press.";
 
 //
 // ───────────────────────────── config ─────────────────────────────
@@ -105,6 +112,7 @@ struct Config {
     chat_timeout: Duration,
     chattiness: u32,
     persona: String,
+    memory: bool,
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -134,9 +142,13 @@ impl Config {
             chat_timeout: Duration::from_millis(env_u64("CATTY_CHAT_TIMEOUT_MS", 20_000)),
             chattiness: env_u64("CATTY_CHATTINESS", 100).min(200) as u32,
             persona,
+            memory: env_string("CATTY_MEMORY")
+                .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "off" | "0" | "false" | "no"))
+                .unwrap_or(true),
         }
     }
 }
+
 
 // ───────────────────────────── LLM (Ollama over plain HTTP) ─────────────────────────────
 
@@ -431,6 +443,8 @@ fn chat_fallback(msg: &str, rng: &mut Rng) -> String {
             "ask me after a nap.",
             "hm. mew?",
         ])
+    } else if any(&["money", "salary", "paycheck"]) {
+        strs(&["where?", "it's gone.", "i was wondering the same thing."])
     } else if any(&["monday"]) {
         strs(&["no.", "absolutely not.", "*goes back to sleep*"])
     } else if any(&["friday"]) {
@@ -451,367 +465,7 @@ fn chat_fallback(msg: &str, rng: &mut Rng) -> String {
     pick_line(rng, &lines, "")
 }
 
-// ───────────────────────────── daemon state ─────────────────────────────
-
-struct Entry {
-    cmd: String,
-    exit: i32,
-}
-
-struct Session {
-    fail_streak: u32,
-    last_cmd: String,
-    gap: u32, // prompts since the cat last spoke in this shell
-    last_seen: Instant,
-}
-
-impl Session {
-    fn new() -> Session {
-        Session {
-            fail_streak: 0,
-            last_cmd: String::new(),
-            gap: 3,
-            last_seen: Instant::now(),
-        }
-    }
-}
-
-struct State {
-    rng: Rng,
-    sessions: HashMap<String, Session>,
-    history: VecDeque<Entry>,
-    last_line: String,
-    llm_ok: u64,
-    llm_fail: u64,
-    last_error: String,
-}
-
-struct Shared {
-    cfg: Config,
-    state: Mutex<State>,
-    busy: AtomicBool,
-    threads: AtomicUsize,
-    last_activity: AtomicU64,
-    sock: PathBuf,
-}
-
-impl Shared {
-    fn new(cfg: Config, sock: PathBuf) -> Shared {
-        Shared {
-            cfg,
-            state: Mutex::new(State {
-                rng: Rng::new(),
-                sessions: HashMap::new(),
-                history: VecDeque::new(),
-                last_line: String::new(),
-                llm_ok: 0,
-                llm_fail: 0,
-                last_error: String::new(),
-            }),
-            busy: AtomicBool::new(false),
-            threads: AtomicUsize::new(0),
-            last_activity: AtomicU64::new(now_secs()),
-            sock,
-        }
-    }
-
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn touch(&self) {
-        self.last_activity.store(now_secs(), Ordering::SeqCst);
-    }
-
-    fn note_llm(&self, r: &Result<String, String>) {
-        let mut g = self.lock();
-        match r {
-            Ok(_) => g.llm_ok += 1,
-            Err(e) => {
-                g.llm_fail += 1;
-                g.last_error = e.clone();
-            }
-        }
-    }
-
-    fn status(&self) -> String {
-        let g = self.lock();
-        format!(
-            "pid={}\nmodel={}\nhost={}\nsessions={}\nllm_ok={}\nllm_fail={}\nlast_error={}\n",
-            std::process::id(),
-            self.cfg.model.as_deref().unwrap_or("(none)"),
-            self.cfg.host,
-            g.sessions.len(),
-            g.llm_ok,
-            g.llm_fail,
-            if g.last_error.is_empty() {
-                "-"
-            } else {
-                g.last_error.as_str()
-            }
-        )
-    }
-}
-
-fn history_text(h: &VecDeque<Entry>) -> String {
-    let mut recent: Vec<&Entry> = h.iter().rev().take(6).collect();
-    recent.reverse();
-    recent
-        .iter()
-        .map(|e| {
-            let status = match e.exit {
-                0 => "ok".to_string(),
-                130 => "ctrl-c".to_string(),
-                c => format!("exit {c}"),
-            };
-            format!(
-                "{} [{}]",
-                e.cmd.chars().take(60).collect::<String>(),
-                status
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
-}
-
-fn system_prompt(cfg: &Config, chat: bool) -> String {
-    let mut s = cfg.persona.clone();
-    if chat {
-        s.push_str("\nAnswer in one or two short sentences.");
-    } else {
-        s.push_str("\nAnswer with exactly one line of 3 to 12 words.");
-    }
-    s
-}
-
-struct Plan {
-    moment: Moment,
-    fallback: String,
-    examples: Vec<String>,
-    ctx: String,
-    cmd: String,
-    dir: String,
-}
-
-fn event_prompt(p: &Plan) -> String {
-    let mut s = String::new();
-    s.push_str(&format!(
-        "Right now: {}\nCommand: {}\nFolder: {}\n",
-        note(&p.moment),
-        p.cmd,
-        p.dir
-    ));
-    if !p.ctx.is_empty() {
-        s.push_str(&format!("Recent commands (oldest first): {}\n", p.ctx));
-    }
-    if !p.examples.is_empty() {
-        s.push_str("\nExamples of your voice (do not copy them):\n");
-        for e in &p.examples {
-            s.push_str(&format!("- {e}\n"));
-        }
-    }
-    s.push_str("\nSay ONE new short line now. Output only the line.");
-    s
-}
-
-fn on_event(sh: &Shared, ev: Event) -> Option<String> {
-    // Leading space = "don't log this" convention (HIST_IGNORE_SPACE / ignorespace).
-    if ev.cmd.trim().is_empty() || ev.cmd.starts_with(' ') {
-        return None;
-    }
-    let segs = parse_segments(&ev.cmd);
-    if segs.first().map(|s| s.prog.as_str()) == Some("catty") {
-        return None;
-    }
-    let shown = redact(&ev.cmd);
-    let dir = basename(ev.cwd.trim_end_matches('/'));
-
-    let plan = {
-        let mut guard = sh.lock();
-        let st: &mut State = &mut guard;
-
-        if st.sessions.len() > 64 {
-            st.sessions
-                .retain(|_, s| s.last_seen.elapsed() < Duration::from_secs(3600));
-        }
-
-        let tool = tool_key(&segs);
-        let danger = segs.iter().find_map(danger_kind);
-        let failed = ev.exit != 0 && ev.exit != 130;
-
-        let sess = st
-            .sessions
-            .entry(ev.session.clone())
-            .or_insert_with(Session::new);
-        sess.last_seen = Instant::now();
-        sess.gap = sess.gap.saturating_add(1);
-        let repeat = failed && sess.fail_streak > 0 && sess.last_cmd == shown;
-        if failed {
-            sess.fail_streak += 1;
-        } else if ev.exit == 0 {
-            sess.fail_streak = 0;
-        }
-        sess.last_cmd = shown.clone();
-        let streak = sess.fail_streak;
-        let gap = sess.gap;
-
-        let moment = classify(ev.exit, ev.secs, streak, repeat, tool, danger);
-
-        st.history.push_back(Entry {
-            cmd: shown.clone(),
-            exit: ev.exit,
-        });
-        while st.history.len() > 10 {
-            st.history.pop_front();
-        }
-
-        let pct = (base_chance(&moment) * sh.cfg.chattiness / 100).min(100);
-        let speak = (is_strong(&moment) || gap >= 3) && st.rng.chance(pct);
-        if !speak {
-            return None;
-        }
-        if let Some(s) = st.sessions.get_mut(&ev.session) {
-            s.gap = 0;
-        }
-
-        let lines = bank(&moment);
-        let fallback = pick_line(&mut st.rng, &lines, &st.last_line);
-        st.last_line = fallback.clone();
-        let examples = sample(&mut st.rng, &lines, 3);
-        Plan {
-            moment,
-            fallback,
-            examples,
-            ctx: history_text(&st.history),
-            cmd: shown,
-            dir,
-        }
-    };
-
-    // The lock is released here: the LLM call must never hold it.
-    let mut text: Option<String> = None;
-    if let Some(model) = sh.cfg.model.as_deref() {
-        // One generation at a time; if it's busy the cat just uses its own voice.
-        if sh
-            .busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            let r = llm(
-                &sh.cfg,
-                model,
-                &system_prompt(&sh.cfg, false),
-                &event_prompt(&plan),
-                64,
-                sh.cfg.deadline,
-            );
-            sh.busy.store(false, Ordering::SeqCst);
-            sh.note_llm(&r);
-            if let Ok(raw) = r {
-                text = sanitize(&raw, 120, true);
-            }
-        }
-    }
-    let line = text.unwrap_or_else(|| plan.fallback.clone());
-    Some(format!("{}\t{}\n", eyes(&plan.moment), line))
-}
-
-fn on_chat(sh: &Shared, req: &str) -> String {
-    let f = wire_fields(req);
-    let msg = f.get("msg").cloned().unwrap_or_default();
-    let msg = msg.trim();
-    if msg.is_empty() {
-        return String::new();
-    }
-    let ctx = {
-        let g = sh.lock();
-        history_text(&g.history)
-    };
-    let mut text: Option<String> = None;
-    if let Some(model) = sh.cfg.model.as_deref() {
-        let mut prompt = String::new();
-        if !ctx.is_empty() {
-            prompt.push_str(&format!(
-                "Recent commands the user ran (oldest first): {ctx}\n\n"
-            ));
-        }
-        prompt.push_str(&format!(
-            "The user says to you: {msg}\nReply in character, at most two short sentences. Output only your reply."
-        ));
-        let r = llm(
-            &sh.cfg,
-            model,
-            &system_prompt(&sh.cfg, true),
-            &prompt,
-            150,
-            sh.cfg.chat_timeout,
-        );
-        sh.note_llm(&r);
-        if let Ok(raw) = r {
-            text = sanitize(&raw, 280, false);
-        }
-    }
-    let text = match text {
-        Some(t) => t,
-        None => {
-            let mut g = sh.lock();
-            chat_fallback(msg, &mut g.rng)
-        }
-    };
-
-    let face = {
-        let mut g = sh.lock();
-        eyes_face(random_face(&mut g.rng))
-    };
-    format!("{face}\t{text}\n")
-    // format!("^ﻌ^\t{text}\n")
-}
-
-// ───────────────────────────── daemon plumbing ─────────────────────────────
-
-struct ThreadSlot(Arc<Shared>);
-
-impl Drop for ThreadSlot {
-    fn drop(&mut self) {
-        self.0.threads.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-fn handle(mut s: UnixStream, sh: &Shared) {
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
-    let mut req = String::new();
-    if (&mut s).take(MAX_MSG).read_to_string(&mut req).is_err() {
-        return;
-    }
-    sh.touch();
-    let head = req.lines().next().unwrap_or("").trim().to_string();
-    let reply = match head.as_str() {
-        "ping" => "pong\n".to_string(),
-        "status" => sh.status(),
-        "quit" => {
-            let _ = s.write_all(b"bye\n");
-            let _ = fs::remove_file(&sh.sock);
-            std::process::exit(0);
-        }
-        "event" => Event::from_wire(&req)
-            .and_then(|ev| on_event(sh, ev))
-            .unwrap_or_default(),
-        "chat" => on_chat(sh, &req),
-        _ => String::new(),
-    };
-    let _ = s.write_all(reply.as_bytes());
-}
-
-fn idle_watch(sh: Arc<Shared>) {
-    loop {
-        thread::sleep(Duration::from_secs(60));
-        if now_secs().saturating_sub(sh.last_activity.load(Ordering::SeqCst)) > IDLE_EXIT_SECS {
-            let _ = fs::remove_file(&sh.sock);
-            std::process::exit(0);
-        }
-    }
-}
+// ───────────────────────────── runtime dir ─────────────────────────────
 
 fn runtime_dir() -> PathBuf {
     if let Some(d) = env_string("CATTY_DIR") {
@@ -826,7 +480,31 @@ fn runtime_dir() -> PathBuf {
 
 /// Private per-user directory. Refuses a directory that is a symlink or belongs to someone else.
 fn prepare_dir() -> io::Result<PathBuf> {
-    let dir = runtime_dir();
+    prepare_private_dir(runtime_dir())
+}
+
+/// Where long-term memory lives. Unlike the runtime dir it survives logout and reboot.
+fn state_dir() -> Option<PathBuf> {
+    if let Some(d) = env_string("CATTY_STATE_DIR") {
+        return Some(PathBuf::from(d));
+    }
+    if let Some(x) = env_string("XDG_STATE_HOME") {
+        return Some(PathBuf::from(x).join("catty"));
+    }
+    env_string("HOME").map(|h| PathBuf::from(h).join(".local").join("state").join("catty"))
+}
+
+fn prepare_state_dir() -> io::Result<PathBuf> {
+    match state_dir() {
+        Some(d) => prepare_private_dir(d),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no state directory (set CATTY_STATE_DIR or HOME)",
+        )),
+    }
+}
+
+fn prepare_private_dir(dir: PathBuf) -> io::Result<PathBuf> {
     let uid = unsafe { getuid() };
     if let Err(e) = DirBuilder::new().recursive(true).mode(0o700).create(&dir) {
         if e.kind() != io::ErrorKind::AlreadyExists {
@@ -844,44 +522,6 @@ fn prepare_dir() -> io::Result<PathBuf> {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
     }
     Ok(dir)
-}
-
-fn run_daemon() -> io::Result<()> {
-    let dir = prepare_dir()?;
-    // flock is the single-instance guard: no check-then-bind race between shells,
-    // and the kernel releases it if we die, so there is never a stale lock.
-    let lock = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .mode(0o600)
-        .open(dir.join(LOCK_NAME))?;
-    if unsafe { flock(lock.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
-        return Ok(()); // another daemon already owns it
-    }
-    let sock = dir.join(SOCK_NAME);
-    let _ = fs::remove_file(&sock); // safe: we hold the lock, so this one is stale
-    let listener = UnixListener::bind(&sock)?;
-    fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))?;
-
-    let shared = Arc::new(Shared::new(Config::from_env(), sock));
-    {
-        let sh = Arc::clone(&shared);
-        thread::spawn(move || idle_watch(sh));
-    }
-    for conn in listener.incoming() {
-        let stream = match conn {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if shared.threads.load(Ordering::SeqCst) >= MAX_THREADS {
-            continue; // drop the connection; the shell just gets no comment
-        }
-        shared.threads.fetch_add(1, Ordering::SeqCst);
-        let slot = ThreadSlot(Arc::clone(&shared));
-        thread::spawn(move || handle(stream, &slot.0));
-    }
-    drop(lock);
-    Ok(())
 }
 
 // ───────────────────────────── client side ─────────────────────────────
@@ -1049,6 +689,18 @@ fn stop_cli() -> io::Result<()> {
     Ok(())
 }
 
+/// Ask the daemon to wipe its memory, then remove the file ourselves in case it isn't running.
+fn forget_cli() -> io::Result<()> {
+    if let Ok(dir) = prepare_dir() {
+        let _ = request(&dir.join(SOCK_NAME), "forget\n", Duration::from_secs(1));
+    }
+    if let Some(dir) = state_dir() {
+        let _ = fs::remove_file(dir.join("memory"));
+    }
+    println!("catty: forgot everything");
+    Ok(())
+}
+
 fn status_cli() -> io::Result<()> {
     let sock = prepare_dir()?.join(SOCK_NAME);
     match request(&sock, "status\n", Duration::from_secs(1)) {
@@ -1125,13 +777,15 @@ fn usage() {
   catty <anything>      talk to the cat
   catty pet             pet the cat
   catty start|stop|restart|status
+  catty forget          wipe the cat's long-term memory
   catty init zsh|bash   print the shell hook
 
   eval "$(catty init zsh)"      # in ~/.zshrc
   eval "$(catty init bash)"     # in ~/.bashrc
 
 env: CATTY_MODEL CATTY_HOST CATTY_DEADLINE_MS CATTY_CHAT_TIMEOUT_MS
-     CATTY_CHATTINESS CATTY_PERSONA CATTY_DIR   (see the header of catty.rs)
+     CATTY_CHATTINESS CATTY_PERSONA CATTY_DIR CATTY_MEMORY CATTY_STATE_DIR
+     (see the header of src/main.rs)
 Start a command with a space and the cat won't see it."#
     );
 }
@@ -1164,6 +818,7 @@ fn run(args: &[String]) -> io::Result<()> {
             Ok(())
         }
         Some("status") => status_cli(),
+        Some("forget") => forget_cli(),
         Some("pet") => chat_cli("*pets you*"),
         Some("__daemon") => run_daemon(),
         Some("__event") => {

@@ -13,6 +13,19 @@ pub(crate) enum Danger {
     Mkfs,
 }
 
+impl Danger {
+    /// Stable name; used as a key in the persisted memory.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Danger::Rm => "rm",
+            Danger::ForcePush => "force-push",
+            Danger::ResetHard => "reset-hard",
+            Danger::Dd => "dd",
+            Danger::Mkfs => "mkfs",
+        }
+    }
+}
+
 /// Coarse kind of command the cat has opinions about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tool {
