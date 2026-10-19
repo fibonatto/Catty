@@ -1,6 +1,5 @@
 //! Minimal JSON helpers: encode a string, and pull one string field out of a document.
 
-
 pub(crate) fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');
